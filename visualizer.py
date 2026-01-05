@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import numpy as np
 
 # Set page layout to wide for better graphing view
 st.set_page_config(layout="wide", page_title="OBD2 Data Visualizer")
@@ -77,17 +78,44 @@ uploaded_file = st.file_uploader("Upload your CSV data file", type=["csv"], labe
 # --- DATA LOADING ---
 @st.cache_data
 def load_data(file):
+    # Read CSV with semi-colon separator
     df = pd.read_csv(file, sep=';', on_bad_lines='skip')
     df.columns = df.columns.str.strip()
 
-    required_cols = ['SECONDS', 'PID', 'VALUE']
-    if not all(col in df.columns for col in required_cols):
-        return None
+    # FORMAT A: Original format (SECONDS, PID, VALUE)
+    if all(col in df.columns for col in ['SECONDS', 'PID', 'VALUE']):
+        df_pivot_load = df.pivot_table(index='SECONDS', columns='PID', values='VALUE', aggfunc='mean')
+        df_pivot_load = df_pivot_load.sort_index()
+        df_pivot_load = df_pivot_load.ffill().bfill()
+        return df_pivot_load
 
-    df_pivot_load = df.pivot_table(index='SECONDS', columns='PID', values='VALUE', aggfunc='mean')
-    df_pivot_load = df_pivot_load.sort_index()
-    df_pivot_load = df_pivot_load.ffill().bfill()
-    return df_pivot_load
+    # FORMAT B: New format (time(ms) and sensor columns)
+    elif 'time(ms)' in df.columns:
+        # Convert time from ms to seconds
+        df['SECONDS'] = df['time(ms)'] / 1000.0
+        df = df.drop(columns=['time(ms)'])
+
+        # Replace the dash '-' representing null values with actual NaNs
+        df = df.replace('-', np.nan)
+
+        # Identify sensor columns (exclude the new SECONDS column)
+        sensor_cols = [c for c in df.columns if c != 'SECONDS']
+
+        # Convert sensor columns to numeric (coercing strings like "Closed Loop" to NaN)
+        for col in sensor_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Group by SECONDS in case of duplicate timestamps, taking the mean
+        df_processed = df.groupby('SECONDS').mean().sort_index()
+
+        # Drop columns that are completely empty after conversion
+        df_processed = df_processed.dropna(axis=1, how='all')
+
+        # Fill holes in the data
+        df_processed = df_processed.ffill().bfill()
+        return df_processed
+
+    return None
 
 
 # --- STATE MANAGEMENT HELPERS ---
@@ -116,9 +144,7 @@ def select_visible_matches():
         matches = all_keys
 
     for m in matches:
-        # 1. Update the master dictionary
         st.session_state['sensor_states_dict'][m] = True
-        # 2. Force the widget key to True so the checkmark appears visually
         st.session_state[f"chk_{m}"] = True
 
 
@@ -127,9 +153,7 @@ def deselect_all():
     Callback: Uncheck All -> Dictionary AND Widget
     """
     for k in st.session_state['sensor_states_dict']:
-        # 1. Update master dictionary
         st.session_state['sensor_states_dict'][k] = False
-        # 2. Force widget key to False
         st.session_state[f"chk_{k}"] = False
 
 
@@ -143,7 +167,9 @@ if uploaded_file is not None:
     df_pivot = load_data(uploaded_file)
 
     if df_pivot is None:
-        st.error("Error: The CSV file does not have the expected format (SECONDS; PID; VALUE).")
+        st.error(
+            "Error: The CSV file format is not recognized. Expected columns: (SECONDS; PID; VALUE) OR (time(ms); "
+            "...sensors).")
     else:
         # --- INITIALIZATION ---
         all_metrics = df_pivot.columns.tolist()
@@ -180,9 +206,7 @@ if uploaded_file is not None:
 
         if current_selection:
             st.sidebar.markdown(f"**Selected ({len(current_selection)}):**")
-            # Create tags
             tags_html = "".join([f"<span class='selected-tag'>{s}</span>" for s in current_selection])
-            # Wrap in the new scrollable container
             st.sidebar.markdown(f"<div class='selected-container'>{tags_html}</div>", unsafe_allow_html=True)
         else:
             st.sidebar.markdown("**Selected:** None")
@@ -242,7 +266,9 @@ if uploaded_file is not None:
                     plot_data = df_pivot[valid_metrics].copy()
 
                     if normalize:
-                        plot_data = (plot_data - plot_data.min()) / (plot_data.max() - plot_data.min())
+                        # Prevent division by zero if all values are the same
+                        denom = (plot_data.max() - plot_data.min())
+                        plot_data = (plot_data - plot_data.min()) / denom.replace(0, 1)
 
                     # --- PLOTTING ---
                     if split_graphs:
